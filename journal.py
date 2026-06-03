@@ -17,7 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Generator, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 # ----------------------------------------------------------------------
 # Defaults
@@ -193,7 +193,7 @@ def print_markdown(text: str) -> None:
 
 
 # ----------------------------------------------------------------------
-# WRITE (NEW STRUCTURE)
+# WRITE (NEW STRUCTURE WITH DEDUPLICATION)
 # ----------------------------------------------------------------------
 def write_entry(base_dir: pathlib.Path, entries: List[str], title: str) -> None:
     """Safely and atomically append a timestamped entry to the YYYY-MM-DD/title.txt location."""
@@ -203,25 +203,23 @@ def write_entry(base_dir: pathlib.Path, entries: List[str], title: str) -> None:
     date_dir = get_date_dir(base_dir, now.date())
     ensure_dir(date_dir)
 
-    file_path = date_dir / f"{title}.txt"
+    # Deduplicate sequential names if there is a collision
+    base_title = title
+    file_path = date_dir / f"{base_title}.txt"
+    counter = 1
+    while file_path.exists():
+        file_path = date_dir / f"{base_title} ({counter}).txt"
+        counter += 1
+
+    header = f"### 🕒 Time: {now:%H:%M:%S}\n\n"
+    content = "\n".join(entries).strip() + "\n\n"
     temp_path = file_path.with_suffix(".tmp")
 
-    # Only write the Time header if the file does not already exist
-    header = ""
-    if not file_path.exists():
-        header = f"### 🕒 Time: {now:%H:%M:%S}\n\n"
-
-    content = "\n".join(entries).strip() + "\n\n"
-
     try:
-        # Read existing file content first to ensure safe atomic updates
-        existing_content = ""
-        if file_path.exists():
-            existing_content = file_path.read_text(encoding="utf-8")
-        
         # Write consolidated content to a temporary file, then swap atomically
-        temp_path.write_text(existing_content + header + content, encoding="utf-8")
+        temp_path.write_text(header + content, encoding="utf-8")
         temp_path.replace(file_path)
+        print(f"journal: entry saved to {file_path.relative_to(base_dir)}")
     except OSError as exc:
         print(f"journal: error: failed to write entry to file {file_path}: {exc}", file=sys.stderr)
         if temp_path.exists():
@@ -264,7 +262,7 @@ def list_titles_for_date(base_dir: pathlib.Path, date: datetime.date) -> None:
                 time_str = time_match.group(1)
         except Exception:
             pass
-        print(f"  • {f.stem} (Time: {time_str})")
+        print(f"  • {f.name} (Time: {time_str})")
 
 
 # ----------------------------------------------------------------------
@@ -275,19 +273,22 @@ def read_journal_content(base_dir: pathlib.Path, title: str) -> str:
     if not base_dir.is_dir():
         return ""
 
+    # Check matching with or without standard .txt extension
+    search_title = title if title.endswith(".txt") else f"{title}.txt"
+
     try:
         # Loop through date folders (e.g., YYYY-MM-DD)
         for date_dir in sorted(base_dir.iterdir(), reverse=True):
             if not date_dir.is_dir():
                 continue
 
-            candidate = date_dir / f"{title}.txt"
+            candidate = date_dir / search_title
             if candidate.is_file():
                 try:
                     content = candidate.read_text(encoding="utf-8").strip()
                     if content:
                         content = clean_duplicate_time_headers(content)
-                        return f"## 📅 Date: {date_dir.name}\n\n{content}"
+                        return f"## 📅 Date: {date_dir.name} | {candidate.stem}\n\n{content}"
                 except OSError as exc:
                     print(f"journal: warning: failed to read file {candidate.name}: {exc}", file=sys.stderr)
     except OSError as exc:
@@ -311,6 +312,7 @@ def get_all_titles(base_dir: pathlib.Path) -> List[str]:
                 continue
             for f in date_dir.glob("*.txt"):
                 titles.add(f.stem)
+                titles.add(f.name)  # Include standard ext names for explicit target looks
     except OSError:
         pass
 
@@ -340,7 +342,7 @@ def list_all(base_dir: pathlib.Path) -> None:
             if files:
                 print(f"\n{date_dir.name}")
                 for f in files:
-                    print(f"  • {f.stem}")
+                    print(f"  • {f.name}")
         except OSError:
             pass
 
@@ -446,8 +448,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-j", "--journal", help="Entry title")
     p.add_argument("-s", "--since",
                    help="Show all entries since DATE (YYYY‑MM‑DD or today/yesterday)")
-    p.add_argument("-v", "--view", nargs="?", const="all",
-                   help="View journals. If empty, lists all folders/files. If partial, lists matching titles. If full, prints entries.")
+    p.add_argument("-v", "--view", nargs="*",
+                   help="View journals. Omitted lists all files. One arg (date) lists matching files. Two args (date, file) prints content.")
+    p.add_argument("-d", "--delete", nargs="*",
+                   help="Delete entries. One arg (date) lists files. Two args (date, file) deletes the file.")
     p.add_argument("entry", nargs="*", help="Direct text entry")
     return p
 
@@ -467,48 +471,134 @@ def main() -> None:
     dp = DateParser()
 
     # ------------------------------------------------------------------
+    # DELETE MODE
+    # ------------------------------------------------------------------
+    if args.delete is not None:
+        if len(args.delete) == 0:
+            print("journal: error: --delete requires a date, or a date and a filename.", file=sys.stderr)
+            sys.exit(1)
+
+        if len(args.delete) == 1:
+            target = args.delete[0].strip()
+            parsed_date = dp.parse(target)
+            if not parsed_date:
+                print(f"journal: error: '{target}' is not a valid date format. Use YYYY-MM-DD.", file=sys.stderr)
+                sys.exit(1)
+
+            date_dir = get_date_dir(base, parsed_date)
+            if not date_dir.exists():
+                print(f"journal: no entries found for {parsed_date} to delete.", file=sys.stderr)
+                return
+
+            files = sorted(date_dir.glob("*.txt"))
+            if not files:
+                print(f"journal: no entries found for {parsed_date} to delete.", file=sys.stderr)
+                return
+
+            print(f"Entries on {parsed_date} available for deletion:")
+            for f in files:
+                print(f"  • {f.name}")
+            return
+
+        if len(args.delete) >= 2:
+            date_str = args.delete[0].strip()
+            filename = args.delete[1].strip()
+
+            parsed_date = dp.parse(date_str)
+            if not parsed_date:
+                print(f"journal: error: '{date_str}' is not a valid date format. Use YYYY-MM-DD.", file=sys.stderr)
+                sys.exit(1)
+
+            if not filename.endswith(".txt"):
+                filename += ".txt"
+
+            date_dir = get_date_dir(base, parsed_date)
+            file_path = date_dir / filename
+            if file_path.is_file():
+                try:
+                    file_path.unlink()
+                    print(f"journal: deleted '{filename}' from {parsed_date}.")
+                    # Safely clean up parent date directory if it is now completely empty
+                    if date_dir.is_dir() and not any(date_dir.iterdir()):
+                        date_dir.rmdir()
+                except OSError as exc:
+                    print(f"journal: error: failed to delete file: {exc}", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                print(f"journal: error: '{filename}' not found on {parsed_date}.", file=sys.stderr)
+                sys.exit(1)
+            return
+
+    # ------------------------------------------------------------------
     # VIEW MODE
     # ------------------------------------------------------------------
     if args.view is not None:
-        if args.view == "all":
+        if len(args.view) == 0 or args.view == ["all"]:
             list_all(base)
             return
 
-        target = args.view.strip()
-        target_lower = target.lower()
+        # Handle single argument lookup
+        if len(args.view) == 1:
+            target = args.view[0].strip()
+            target_lower = target.lower()
 
-        # Try viewing as a pure YYYY-MM-DD date lookup first
-        parsed_date = dp.parse(target)
-        if parsed_date:
-            list_titles_for_date(base, parsed_date)
+            # Try viewing as a pure YYYY-MM-DD date lookup first
+            parsed_date = dp.parse(target)
+            if parsed_date:
+                list_titles_for_date(base, parsed_date)
+                return
+
+            # Try to locate exact title (case-insensitive check)
+            all_titles = get_all_titles(base)
+            exact_match: Optional[str] = None
+            for title in all_titles:
+                if title.lower() == target_lower:
+                    exact_match = title
+                    break
+
+            if exact_match:
+                content = read_journal_content(base, exact_match)
+                if content:
+                    markdown_payload = f"# 📒 Journal Title: {exact_match}\n\n{content}"
+                    print_markdown(markdown_payload)
+                else:
+                    print(f"journal: no entries found with exact title '{exact_match}'.", file=sys.stderr)
+            else:
+                # Fall back to show partial keyword title matches
+                matching_titles = [t for t in all_titles if target_lower in t.lower()]
+                if matching_titles:
+                    print(f"No exact match found for '{target}'. Partial matches available:")
+                    for match in sorted(list(set(matching_titles))):
+                        print(f"  • {match}")
+                else:
+                    print(f"journal: error: '{target}' does not match any sub-journal title or valid date format.", file=sys.stderr)
+                    sys.exit(1)
             return
 
-        # Try to locate exact title (case-insensitive check)
-        all_titles = get_all_titles(base)
-        exact_match: Optional[str] = None
-        for title in all_titles:
-            if title.lower() == target_lower:
-                exact_match = title
-                break
+        # Handle dual-argument lookup (date AND explicit file match)
+        if len(args.view) >= 2:
+            date_str = args.view[0].strip()
+            filename = args.view[1].strip()
 
-        if exact_match:
-            content = read_journal_content(base, exact_match)
-            if content:
-                markdown_payload = f"# 📒 Journal Title: {exact_match}\n\n{content}"
-                print_markdown(markdown_payload)
-            else:
-                print(f"journal: no entries found with exact title '{exact_match}'.", file=sys.stderr)
-        else:
-            # Fall back to show partial keyword title matches
-            matching_titles = [t for t in all_titles if target_lower in t.lower()]
-            if matching_titles:
-                print(f"No exact match found for '{target}'. Partial matches available:")
-                for match in matching_titles:
-                    print(f"  {match}")
-            else:
-                print(f"journal: error: '{target}' does not match any sub-journal title or valid date format.", file=sys.stderr)
+            parsed_date = dp.parse(date_str)
+            if not parsed_date:
+                print(f"journal: error: '{date_str}' is not a valid date format. Use YYYY-MM-DD.", file=sys.stderr)
                 sys.exit(1)
-        return
+
+            if not filename.endswith(".txt"):
+                filename += ".txt"
+
+            date_dir = get_date_dir(base, parsed_date)
+            file_path = date_dir / filename
+            if file_path.is_file():
+                content = file_path.read_text(encoding="utf-8").strip()
+                content = clean_duplicate_time_headers(content)
+                payload = f"# 📒 {parsed_date} | {file_path.stem}\n\n{content}"
+                print_markdown(payload)
+            else:
+                print(f"journal: error: '{filename}' not found on {parsed_date}.", file=sys.stderr)
+                sys.exit(1)
+            return
 
     # ------------------------------------------------------------------
     # SINCE
