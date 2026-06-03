@@ -4,13 +4,8 @@
 """
 A simple CLI journal tool (Python 3.8+).
 
-Features
---------
-* Store daily entries in ``~/.journal`` (one text file per day).
-* Configurable location via ``~/.journalrc``.
-* View specific sub-journals by title, partial titles, or list all available sub-journals.
-* Supports safe multi-line pasting in terminal environments.
-* Seamless rendering of Markdown via Glow integration.
+Storage Format:
+~/.journal/YYYY-MM-DD/title.txt
 """
 
 import argparse
@@ -25,20 +20,15 @@ import sys
 from typing import Generator, List, Optional, Tuple
 
 # ----------------------------------------------------------------------
-# Defaults & Global Regex Pattern
+# Defaults
 # ----------------------------------------------------------------------
 DEFAULT_JOURNAL = "~/.journal"
 DEFAULT_JOURNAL_RC = "~/.journalrc"
-
-# Look for legacy files matching YYYY.MM.DD.txt
-DATE_PATTERN = re.compile(r"^(\d{4})\.(\d{2})\.(\d{2})\.txt$")
 
 
 # ----------------------------------------------------------------------
 # Terminal & Console Formatting Setup
 # ----------------------------------------------------------------------
-
-
 def init_terminal() -> None:
     """Ensure UTF-8 encoding and ANSI escape sequence compatibility."""
     if sys.platform == "win32":
@@ -62,10 +52,8 @@ def init_terminal() -> None:
 
 
 # ----------------------------------------------------------------------
-# Helper classes
+# Helper classes & Date Parsers
 # ----------------------------------------------------------------------
-
-
 class DateParser:
     """Parse informal date strings (e.g. ``2023-04-01`` or ``yesterday``)."""
 
@@ -98,10 +86,8 @@ class DateParser:
 
 
 # ----------------------------------------------------------------------
-# Core journal functionality
+# Core Path/Config Helpers
 # ----------------------------------------------------------------------
-
-
 def expand_path(p: str) -> pathlib.Path:
     """Expand ``~`` and return a fully resolved ``Path`` object."""
     return pathlib.Path(os.path.expanduser(p)).resolve()
@@ -113,17 +99,9 @@ def load_config(config_path: pathlib.Path) -> pathlib.Path:
         return expand_path(DEFAULT_JOURNAL)
 
     try:
-        cfg = configparser.ConfigParser(
-            {
-                "journal": {"default": "__journal"},
-                "__journal": {"location": DEFAULT_JOURNAL},
-            }
-        )
+        cfg = configparser.ConfigParser()
         cfg.read(config_path, encoding="utf-8")
-
-        # Resolve which section holds the journal location
-        journal_section = cfg.get("journal", "default", fallback="__journal")
-        location = cfg.get(journal_section, "location", fallback=DEFAULT_JOURNAL)
+        location = cfg.get("journal", "location", fallback=DEFAULT_JOURNAL)
         return expand_path(location)
     except Exception as exc:
         print(f"journal: warning: failed to parse config {config_path}: {exc}. Using default.", file=sys.stderr)
@@ -140,11 +118,14 @@ def ensure_dir(p: pathlib.Path) -> None:
             sys.exit(1)
 
 
-def journal_file_path(journal_dir: pathlib.Path, date: datetime.date) -> pathlib.Path:
-    """Determine legacy file name ``YYYY.MM.DD.txt`` inside ``journal_dir``."""
-    return journal_dir / f"{date:%Y.%m.%d}.txt"
+def get_date_dir(base: pathlib.Path, date: datetime.date) -> pathlib.Path:
+    """Determine the date-based sub-folder layout: base_dir/YYYY-MM-DD."""
+    return base / f"{date:%Y-%m-%d}"
 
 
+# ----------------------------------------------------------------------
+# Content Normalization
+# ----------------------------------------------------------------------
 def normalize_markdown(text: str) -> str:
     """Normalize and format markdown text to ensure reliable rendering across parsers."""
     # Normalize Windows line endings to Unix style
@@ -161,7 +142,6 @@ def normalize_markdown(text: str) -> str:
 
 def clean_duplicate_time_headers(content: str) -> str:
     """Clean duplicate or legacy timestamp header flags from the markdown content body."""
-    # Matches any but the first occurrence of time headers to keep formatting tidy
     pattern = r'(?m)^###\s*🕒\s*Time:\s*\d{2}[:-_.]\d{2}[:-_.]\d{2}\s*\n*'
     first_match = re.search(pattern, content)
     if first_match:
@@ -172,6 +152,9 @@ def clean_duplicate_time_headers(content: str) -> str:
     return content.strip()
 
 
+# ----------------------------------------------------------------------
+# Markdown Rendering
+# ----------------------------------------------------------------------
 def get_glow_command() -> Optional[List[str]]:
     """Resolve glow path dynamically and append optional configuration arguments."""
     glow_bin = shutil.which("glow") or shutil.which("glow.exe")
@@ -193,7 +176,7 @@ def print_markdown(text: str) -> None:
 
     if glow_cmd:
         try:
-            # Safely pipe normalized content through stdin directly to Glow
+            # Safely pipe normalized content through stdin directly to Glow with encoding forced to UTF-8
             subprocess.run(
                 glow_cmd + ["-"],
                 input=normalized_text,
@@ -209,37 +192,38 @@ def print_markdown(text: str) -> None:
     print(normalized_text)
 
 
-def write_entry(journal_dir: pathlib.Path, entries: List[str], filename_override: Optional[str] = None) -> None:
-    """Safely and atomically append a timestamped entry to today's journal file."""
-    ensure_dir(journal_dir)
+# ----------------------------------------------------------------------
+# WRITE (NEW STRUCTURE)
+# ----------------------------------------------------------------------
+def write_entry(base_dir: pathlib.Path, entries: List[str], title: str) -> None:
+    """Safely and atomically append a timestamped entry to the YYYY-MM-DD/title.txt location."""
+    ensure_dir(base_dir)
+
     now = datetime.datetime.now()
-    
-    if filename_override:
-        path = journal_dir / filename_override
-    else:
-        path = journal_file_path(journal_dir, now.date())
+    date_dir = get_date_dir(base_dir, now.date())
+    ensure_dir(date_dir)
+
+    file_path = date_dir / f"{title}.txt"
+    temp_path = file_path.with_suffix(".tmp")
 
     # Only write the Time header if the file does not already exist
     header = ""
-    if not path.is_file():
+    if not file_path.exists():
         header = f"### 🕒 Time: {now:%H:%M:%S}\n\n"
-    
-    raw_content = "\n".join(entries)
-    entry_line = raw_content + "\n\n"
-        
-    temp_path = path.with_suffix(".tmp")
-    
+
+    content = "\n".join(entries).strip() + "\n\n"
+
     try:
         # Read existing file content first to ensure safe atomic updates
         existing_content = ""
-        if path.is_file():
-            existing_content = path.read_text(encoding="utf-8")
+        if file_path.exists():
+            existing_content = file_path.read_text(encoding="utf-8")
         
         # Write consolidated content to a temporary file, then swap atomically
-        temp_path.write_text(existing_content + header + entry_line, encoding="utf-8")
-        temp_path.replace(path)
+        temp_path.write_text(existing_content + header + content, encoding="utf-8")
+        temp_path.replace(file_path)
     except OSError as exc:
-        print(f"journal: error: failed to write entry to file {path}: {exc}", file=sys.stderr)
+        print(f"journal: error: failed to write entry to file {file_path}: {exc}", file=sys.stderr)
         if temp_path.exists():
             try:
                 temp_path.unlink()
@@ -248,298 +232,181 @@ def write_entry(journal_dir: pathlib.Path, entries: List[str], filename_override
         sys.exit(1)
 
 
-def get_all_virtual_journals(base_dir: pathlib.Path) -> List[str]:
-    """Return all unique journal titles (folders, nested timestamp files, and raw date folders)."""
-    titles = set()
-    if not base_dir.is_dir():
-        return []
-    
+# ----------------------------------------------------------------------
+# LIST ENTRIES IN DATE
+# ----------------------------------------------------------------------
+def list_titles_for_date(base_dir: pathlib.Path, date: datetime.date) -> None:
+    """Find and print only the titles of entries on a specific date, without showing their full contents."""
+    date_dir = get_date_dir(base_dir, date)
+
+    if not date_dir.exists():
+        print(f"journal: no entries found for {date}.", file=sys.stderr)
+        return
+
     try:
-        for item in base_dir.iterdir():
-            if item.is_dir():
-                # If directory name matches YYYY-MM-DD, add it AND look inside for sub-entries
-                if re.match(r"^\d{4}-\d{2}-\d{2}$", item.name):
-                    titles.add(item.name)
-                    try:
-                        for sub_item in item.iterdir():
-                            if sub_item.is_file() and re.match(r"^\d{2}[-_.]\d{2}[-_.]\d{2}\.txt$", sub_item.name):
-                                time_part = sub_item.name.replace(".txt", "").replace("_", "-").replace(".", "-")
-                                titles.add(f"{item.name}T{time_part}")
-                    except OSError:
-                        pass
-                else:
-                    titles.add(item.name)
+        files = sorted(date_dir.glob("*.txt"))
     except OSError as exc:
-        print(f"journal: error: failed to list sub-journals in {base_dir}: {exc}", file=sys.stderr)
-        
+        print(f"journal: error: failed to read entries on date {date}: {exc}", file=sys.stderr)
+        return
+
+    if not files:
+        print(f"journal: no entries found for {date}.", file=sys.stderr)
+        return
+
+    print(f"Journal entries for {date}:")
+    for f in files:
+        # Extract time header if present to show time next to titles
+        time_str = "Legacy Entry"
+        try:
+            first_few_lines = f.read_text(encoding="utf-8")[:200]
+            time_match = re.search(r"Time:\s*(\d{2}[:-_.]\d{2}[:-_.]\d{2})", first_few_lines)
+            if time_match:
+                time_str = time_match.group(1)
+        except Exception:
+            pass
+        print(f"  • {f.stem} (Time: {time_str})")
+
+
+# ----------------------------------------------------------------------
+# READ ENTRY
+# ----------------------------------------------------------------------
+def read_journal_content(base_dir: pathlib.Path, title: str) -> str:
+    """Scan all date directories and read the content of a target journal entry."""
+    if not base_dir.is_dir():
+        return ""
+
+    try:
+        # Loop through date folders (e.g., YYYY-MM-DD)
+        for date_dir in sorted(base_dir.iterdir(), reverse=True):
+            if not date_dir.is_dir():
+                continue
+
+            candidate = date_dir / f"{title}.txt"
+            if candidate.is_file():
+                try:
+                    content = candidate.read_text(encoding="utf-8").strip()
+                    if content:
+                        content = clean_duplicate_time_headers(content)
+                        return f"## 📅 Date: {date_dir.name}\n\n{content}"
+                except OSError as exc:
+                    print(f"journal: warning: failed to read file {candidate.name}: {exc}", file=sys.stderr)
+    except OSError as exc:
+         print(f"journal: error: failed to scan base directory {base_dir}: {exc}", file=sys.stderr)
+
+    return ""
+
+
+# ----------------------------------------------------------------------
+# LIST ALL TITLES & DATE DIRECTORIES
+# ----------------------------------------------------------------------
+def get_all_titles(base_dir: pathlib.Path) -> List[str]:
+    """Return all unique journal titles found inside our date directories."""
+    titles = set()
+    if not base_dir.exists():
+        return []
+
+    try:
+        for date_dir in base_dir.iterdir():
+            if not date_dir.is_dir():
+                continue
+            for f in date_dir.glob("*.txt"):
+                titles.add(f.stem)
+    except OSError:
+        pass
+
     return sorted(list(titles))
 
 
-def list_available_dates_and_subjournals(base_dir: pathlib.Path) -> None:
-    """Find and print only available dates and sub-journals in the system without entries."""
-    dates = set()
-    sub_journals = set()
-    
-    if not base_dir.is_dir():
-        print("journal: no journals found.", file=sys.stderr)
+def list_all(base_dir: pathlib.Path) -> None:
+    """Show available journals nested cleanly under their parent YYYY-MM-DD date folders."""
+    if not base_dir.exists():
+        print("journal: empty")
         return
-        
+
     try:
-        # Scan the base directory
-        for item in base_dir.iterdir():
-            if item.is_dir():
-                if re.match(r"^\d{4}-\d{2}-\d{2}$", item.name):
-                    dates.add(item.name)
-                else:
-                    sub_journals.add(item.name)
-                    # Scan inside sub-journals for nested date folders or legacy files
-                    try:
-                        for sub_item in item.iterdir():
-                            if sub_item.is_dir() and re.match(r"^\d{4}-\d{2}-\d{2}$", sub_item.name):
-                                dates.add(sub_item.name)
-                            elif sub_item.is_file():
-                                match = DATE_PATTERN.match(sub_item.name)
-                                if match:
-                                    dates.add(f"{match.group(1)}-{match.group(2)}-{match.group(3)}")
-                    except OSError:
-                        pass
-            elif item.is_file():
-                match = DATE_PATTERN.match(item.name)
-                if match:
-                    dates.add(f"{match.group(1)}-{match.group(2)}-{match.group(3)}")
+        dirs = [d for d in base_dir.iterdir() if d.is_dir()]
     except OSError as exc:
-        print(f"journal: error: failed to scan directory {base_dir}: {exc}", file=sys.stderr)
+        print(f"journal: error: failed to list directories in {base_dir}: {exc}", file=sys.stderr)
         return
 
-    if not dates and not sub_journals:
-        print("journal: no entries found.")
+    if not dirs:
+        print("journal: empty")
         return
 
-    if dates:
-        print("Available Journal Dates:")
-        for d in sorted(list(dates)):
-            print(f"  {d}")
-        print()
-
-    if sub_journals:
-        print("Available Sub-Journals:")
-        for sj in sorted(list(sub_journals)):
-            print(f"  {sj}")
-
-
-def list_titles_for_date(base_dir: pathlib.Path, target_date: datetime.date) -> None:
-    """Find and print only the titles/times of entries on a specific date, without content."""
-    date_str_legacy = f"{target_date:%Y.%m.%d}.txt"
-    date_str_new = f"{target_date:%Y-%m-%d}"
-    
-    found_items = []
-    
-    # Walk through the base directory
-    for root_dir, _, files in os.walk(base_dir):
-        root_path = pathlib.Path(root_dir)
-        
-        # 1. Legacy file check
-        if date_str_legacy in files:
-            try:
-                rel_path = root_path.relative_to(base_dir)
-                sub_journal = rel_path.parts[0] if len(rel_path.parts) > 0 else "Root Journal"
-            except Exception:
-                sub_journal = "Root Journal"
-            
-            time_str = "Legacy Entry"
-            file_path = root_path / date_str_legacy
-            try:
-                first_few_lines = file_path.read_text(encoding="utf-8")[:200]
-                time_match = re.search(r"Time:\s*(\d{2}[:-_.]\d{2}[:-_.]\d{2})", first_few_lines)
-                if time_match:
-                    time_str = time_match.group(1)
-            except Exception:
-                pass
-            
-            found_items.append((sub_journal, time_str))
-            
-        # 2. New timestamped format check (parent folder matches YYYY-MM-DD)
-        if root_path.name == date_str_new:
-            for file in sorted(files):
-                if re.match(r"^\d{2}[-_.]\d{2}[-_.]\d{2}\.txt$", file):
-                    time_part = file.replace(".txt", "").replace("_", ":").replace("-", ":")
-                    try:
-                        rel_path = root_path.parent.relative_to(base_dir)
-                        if rel_path == pathlib.Path("."):
-                            title_str = f"{date_str_new}T{file.replace('.txt', '')}"
-                        else:
-                            title_str = f"{rel_path.parts[0]} (Virtual Title: {rel_path.parts[0]}T{file.replace('.txt', '')})"
-                    except Exception:
-                        title_str = f"{date_str_new}T{file.replace('.txt', '')}"
-                    
-                    found_items.append((title_str, time_part))
-                    
-    if not found_items:
-        print(f"journal: no entries found on date {target_date}.", file=sys.stderr)
-    else:
-        print(f"Journal entries available for {target_date}:")
-        for title, time_val in sorted(found_items):
-            print(f"  • {title} (Time: {time_val})")
+    print("Available Journals:")
+    for date_dir in sorted(dirs):
+        try:
+            files = sorted(date_dir.glob("*.txt"))
+            if files:
+                print(f"\n{date_dir.name}")
+                for f in files:
+                    print(f"  • {f.stem}")
+        except OSError:
+            pass
 
 
-def read_journal_content(base_dir: pathlib.Path, journal_title: str) -> str:
-    """Read the content of a journal, whether it is a physical folder or a virtual timestamped sub-journal."""
-    # Case 1: Virtual timestamped journal (e.g., YYYY-MM-DDTHH-MM-SS)
-    timestamp_match = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{2})[-_.](\d{2})[-_.](\d{2})$", journal_title)
-    if timestamp_match:
-        day_part = timestamp_match.group(1)
-        h, m, s = timestamp_match.group(2), timestamp_match.group(3), timestamp_match.group(4)
-        
-        # Check potential filename variants (dashes, underscores, dots)
-        variants = [f"{h}-{m}-{s}.txt", f"{h}_{m}_{s}.txt", f"{h}.{m}.{s}.txt"]
-        for var in variants:
-            target_file = base_dir / day_part / var
-            if target_file.is_file():
-                try:
-                    content = target_file.read_text(encoding="utf-8").strip()
-                    if content:
-                        content = clean_duplicate_time_headers(content)
-                        return f"## 📅 Date: {day_part}\n\n{content}"
-                except OSError as exc:
-                    print(f"journal: warning: failed to read file {target_file.name}: {exc}", file=sys.stderr)
-        return ""
-
-    # Case 2: Physical sub-journal or date directory (e.g., 'Work' or '2026-06-03')
-    target_dir = base_dir / journal_title
-    if not target_dir.is_dir():
-        return ""
-
-    output_blocks = []
-    try:
-        # If the directory itself is a YYYY-MM-DD folder, directly read its nested timestamp entries
-        if re.match(r"^\d{4}-\d{2}-\d{2}$", target_dir.name):
-            for file in sorted(target_dir.iterdir()):
-                if file.is_file() and re.match(r"^\d{2}[-_.]\d{2}[-_.]\d{2}\.txt$", file.name):
-                    try:
-                        content = file.read_text(encoding="utf-8").strip()
-                        if content:
-                            content = clean_duplicate_time_headers(content)
-                            block = f"## 📅 Date: {target_dir.name}\n\n{content}"
-                            output_blocks.append(block)
-                    except OSError:
-                        pass
-        else:
-            # Check for legacy files directly inside general sub-journals
-            for file in sorted(target_dir.iterdir()):
-                if DATE_PATTERN.match(file.name) and file.is_file():
-                    date_str = file.name.replace(".txt", "").replace(".", "-")
-                    try:
-                        content = file.read_text(encoding="utf-8").strip()
-                        if content:
-                            output_blocks.append(f"## 📅 Date: {date_str}\n\n{content}")
-                    except OSError as exc:
-                        print(f"journal: warning: failed to read file {file.name}: {exc}", file=sys.stderr)
-                
-                # Support nested timestamped entries inside this sub-journal folder
-                # e.g., Work/YYYY-MM-DD/HH-MM-SS.txt
-                elif file.is_dir() and re.match(r"^\d{4}-\d{2}-\d{2}$", file.name):
-                    for sub_file in sorted(file.iterdir()):
-                        if sub_file.is_file() and re.match(r"^\d{2}[-_.]\d{2}[-_.]\d{2}\.txt$", sub_file.name):
-                            try:
-                                content = sub_file.read_text(encoding="utf-8").strip()
-                                if content:
-                                    content = clean_duplicate_time_headers(content)
-                                    block = f"## 📅 Date: {file.name}\n\n{content}"
-                                    output_blocks.append(block)
-                            except OSError:
-                                pass
-    except OSError as exc:
-        print(f"journal: error: failed to read directory {target_dir}: {exc}", file=sys.stderr)
-
-    # Use a visual separator between aggregated files that remains completely Glow-friendly
-    return "\n\n---\n\n".join(output_blocks)
-
-
-def iter_dates(start: datetime.date, end: datetime.date) -> Generator[datetime.date, None, None]:
-    """Yield each date from ``start`` to ``end`` inclusive."""
-    for n in range((end - start).days + 1):
-        yield start + datetime.timedelta(days=n)
-
-
-def show_since(journal_dir: pathlib.Path, since: datetime.date) -> None:
+# ----------------------------------------------------------------------
+# SINCE
+# ----------------------------------------------------------------------
+def show_since(base_dir: pathlib.Path, since: datetime.date) -> None:
     """Print all entries from ``since`` up to today, sorted globally in chronological order."""
     today = datetime.date.today()
     collected_entries: List[Tuple[datetime.date, str, str]] = []
 
-    # Traverse all folders to collect matching entries
-    for root_dir, _, files in os.walk(journal_dir):
-        root_path = pathlib.Path(root_dir)
-        parent_dir_name = root_path.name
-        parent_match = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", parent_dir_name)
-        
-        for filename in files:
-            # 1. New timestamped format (parent directory matches YYYY-MM-DD)
-            file_match = re.match(r"^(\d{2})[-_.](\d{2})[-_.](\d{2})\.txt$", filename)
-            if parent_match and file_match:
+    if not base_dir.is_dir():
+        print("journal: empty")
+        return
+
+    try:
+        for date_dir in base_dir.iterdir():
+            if not date_dir.is_dir():
+                continue
+
+            try:
+                dir_date = datetime.datetime.strptime(date_dir.name, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+
+            if since <= dir_date <= today:
                 try:
-                    file_date = datetime.date(
-                        int(parent_match.group(1)),
-                        int(parent_match.group(2)),
-                        int(parent_match.group(3))
-                    )
-                    if since <= file_date <= today:
-                        path = root_path / filename
-                        content = path.read_text(encoding="utf-8").strip()
+                    for f in sorted(date_dir.glob("*.txt")):
+                        content = f.read_text(encoding="utf-8").strip()
                         if content:
-                            try:
-                                content = clean_duplicate_time_headers(content)
-                                rel_path = root_path.relative_to(journal_dir)
-                                parts = rel_path.parts
-                                sub_journal = parts[0] if len(parts) >= 2 else f"{parent_dir_name}T{file_match.group(1)}-{file_match.group(2)}-{file_match.group(3)}"
-                            except Exception:
-                                sub_journal = parent_dir_name
-                            collected_entries.append((file_date, sub_journal, content))
-                except (ValueError, OSError):
+                            content = clean_duplicate_time_headers(content)
+                            collected_entries.append((dir_date, f.stem, content))
+                except OSError:
                     pass
-            
-            # 2. Legacy format (file itself is YYYY.MM.DD.txt)
-            match = DATE_PATTERN.match(filename)
-            if match:
-                try:
-                    file_date = datetime.date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
-                    if since <= file_date <= today:
-                        path = root_path / filename
-                        content = path.read_text(encoding="utf-8").strip()
-                        if content:
-                            sub_journal = root_path.name if root_path != journal_dir else "Root Journal"
-                            collected_entries.append((file_date, sub_journal, content))
-                except (ValueError, OSError):
-                    pass
+    except OSError as exc:
+        print(f"journal: error: failed to read entries since {since}: {exc}", file=sys.stderr)
+        return
 
     if not collected_entries:
         print("journal: no matching entries found.")
         return
 
-    # Sort globally by date first, then by sub-journal name
+    # Sort globally by date first, then by title name
     collected_entries.sort(key=lambda x: (x[0], x[1]))
 
     full_output = [f"# 📚 Journal Entries Since {since}"]
-    for entry_date, sub_journal, content in collected_entries:
-        if "T" in sub_journal:
-            parts = sub_journal.split("T", 1)
-            time_part = parts[1].replace("-", ":")
-            header = f"## 📅 {entry_date:%Y-%m-%d}\n### 🕒 Time: {time_part}\n"
-        else:
-            header = f"## 📅 {entry_date:%Y-%m-%d} | {sub_journal}\n"
+    for entry_date, title, content in collected_entries:
+        header = f"## 📅 {entry_date:%Y-%m-%d} | {title}\n"
         full_output.append(f"{header}\n{content}")
 
     print_markdown("\n\n---\n\n".join(full_output))
 
 
+# ----------------------------------------------------------------------
+# Multi-line Prompt helper
+# ----------------------------------------------------------------------
 def prompt_for_entry() -> List[str]:
     """Prompt the user for their journal entry directly with multi-line paste/input capability."""
     print("----------------------------------------------------------------------")
     print("Enter/Paste your journal entry. When finished:")
     if sys.platform == "win32":
-        print("  - Type ':wq' or 'DONE' on a new line and press Enter")
+        print("  - Type ':wq' on a new line and press Enter")
         print("  - OR press Ctrl+Z then Enter to submit.")
     else:
-        print("  - Type ':wq' or 'DONE' on a new line and press Enter")
+        print("  - Type ':wq' on a new line and press Enter")
         print("  - OR press Ctrl+D to submit.")
     print("----------------------------------------------------------------------")
     
@@ -547,8 +414,8 @@ def prompt_for_entry() -> List[str]:
     while True:
         try:
             line = input()
-            # Intercept common editor/saving exit indicators
-            if line.strip() in (":wq", "DONE", "done"):
+            # Intercept saving exit indicator
+            if line.strip() == ":wq":
                 break
             lines.append(line)
         except EOFError:
@@ -565,159 +432,118 @@ def prompt_for_entry() -> List[str]:
 
 
 # ----------------------------------------------------------------------
-# Argument handling
+# ARG PARSER
 # ----------------------------------------------------------------------
-
-
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(
         description="A CLI tool to help with keeping a work/personal journal"
     )
-    parser.add_argument("--version", action="version", version="journal 1.0")
-
-    # Config / location
-    parser.add_argument("-c", "--config", metavar="FILE", default=DEFAULT_JOURNAL_RC,
-                        help="Path to config file (default: %(default)s)")
-    parser.add_argument("-j", "--journal", metavar="NAME",
-                        help="Sub‑journal name (creates a sub‑folder)")
-    parser.add_argument("-l", "--location", metavar="DIR",
-                        help="Override journal storage location")
-
-    # Viewing options
-    parser.add_argument("-s", "--since", metavar="DATE",
-                        help="Show all entries since DATE (YYYY‑MM‑DD or today/yesterday)")
-    
-    # Optional search query or empty list
-    parser.add_argument("-v", "--view", metavar="TITLE", nargs="?", const="all",
-                        help="View journals. If empty, lists all titles. If partial string, lists matching titles. If full title, prints entries.")
-
-    # Free‑form entry text
-    parser.add_argument("entry", nargs="*", help="Text to add as a new journal entry")
-
-    return parser
+    p.add_argument("--version", action="version", version="journal 1.0")
+    p.add_argument("-c", "--config", default=DEFAULT_JOURNAL_RC,
+                   help="Path to config file")
+    p.add_argument("-l", "--location",
+                   help="Override journal storage location")
+    p.add_argument("-j", "--journal", help="Entry title")
+    p.add_argument("-s", "--since",
+                   help="Show all entries since DATE (YYYY‑MM‑DD or today/yesterday)")
+    p.add_argument("-v", "--view", nargs="?", const="all",
+                   help="View journals. If empty, lists all folders/files. If partial, lists matching titles. If full, prints entries.")
+    p.add_argument("entry", nargs="*", help="Direct text entry")
+    return p
 
 
+# ----------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------
 def main() -> None:
     init_terminal()
 
-    parser = build_parser()
-    args = parser.parse_args()
+    args = build_parser().parse_args()
 
-    # Determine the base journal directory
-    config_path = expand_path(args.config)
-    base_journal_dir = load_config(config_path)
-
+    base = load_config(expand_path(args.config))
     if args.location:
-        base_journal_dir = expand_path(args.location)
-
-    # Handle Sub-Journal Name logic (only prompt if we aren't viewing historical logs)
-    is_viewing = args.view is not None or args.since is not None
-    journal_name = args.journal
-
-    if not journal_name and not is_viewing:
-        # Generate default timestamp: YYYY-mm-dayThour-minute-second
-        default_name = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-        try:
-            journal_name = input(f"Enter sub-journal name [{default_name}]: ").strip()
-            if not journal_name:
-                journal_name = default_name
-        except (KeyboardInterrupt, EOFError):
-            print("\nOperation cancelled.", file=sys.stderr)
-            sys.exit(1)
-
-    # Target directory and filename overrides for writes
-    active_journal_dir = base_journal_dir
-    filename_override = None
-
-    if journal_name:
-        if 'T' in journal_name:
-            parts = journal_name.split('T', 1)
-            day_part = parts[0]
-            time_part = parts[1]
-            
-            # Ensure day_part looks like a date (e.g. YYYY-MM-DD)
-            if re.match(r"^\d{4}-\d{2}-\d{2}$", day_part):
-                # Clean time_part to be safe for filenames (replace ':' with '-')
-                time_part_safe = time_part.replace(':', '-')
-                active_journal_dir = base_journal_dir / day_part
-                filename_override = f"{time_part_safe}.txt"
-            else:
-                active_journal_dir = base_journal_dir / journal_name
-        else:
-            active_journal_dir = base_journal_dir / journal_name
+        base = expand_path(args.location)
 
     dp = DateParser()
 
     # ------------------------------------------------------------------
-    # View logic with dynamic filtering/printing
+    # VIEW MODE
     # ------------------------------------------------------------------
-    if args.view:
-        all_titles = get_all_virtual_journals(base_journal_dir)
-        
-        # Scenario 1: --view was passed completely empty
+    if args.view is not None:
         if args.view == "all":
-            list_available_dates_and_subjournals(base_journal_dir)
-                    
-        # Scenario 2: User gave a search query (either exact title or partial search query)
-        else:
-            search_query = args.view.strip()
-            search_query_lower = search_query.lower()
-            
-            # Check for exact case-insensitive match
-            exact_match: Optional[str] = None
-            for title in all_titles:
-                if title.lower() == search_query_lower:
-                    exact_match = title
-                    break
-            
-            if exact_match:
-                content = read_journal_content(base_journal_dir, exact_match)
-                if content:
-                    markdown_payload = f"# 📒 Journal Title: {exact_match}\n\n{content}"
-                    print_markdown(markdown_payload)
-                else:
-                    print(f"journal: no entries found inside folder '{exact_match}'.", file=sys.stderr)
-            
-            # Scenario 3: Not an exact title match. Check if it parses cleanly as a target date.
+            list_all(base)
+            return
+
+        target = args.view.strip()
+        target_lower = target.lower()
+
+        # Try viewing as a pure YYYY-MM-DD date lookup first
+        parsed_date = dp.parse(target)
+        if parsed_date:
+            list_titles_for_date(base, parsed_date)
+            return
+
+        # Try to locate exact title (case-insensitive check)
+        all_titles = get_all_titles(base)
+        exact_match: Optional[str] = None
+        for title in all_titles:
+            if title.lower() == target_lower:
+                exact_match = title
+                break
+
+        if exact_match:
+            content = read_journal_content(base, exact_match)
+            if content:
+                markdown_payload = f"# 📒 Journal Title: {exact_match}\n\n{content}"
+                print_markdown(markdown_payload)
             else:
-                target_date = dp.parse(search_query)
-                if target_date:
-                    list_titles_for_date(base_journal_dir, target_date)
-                else:
-                    # Treat search as a partial keyword title match
-                    matching_titles = [t for t in all_titles if search_query_lower in t.lower()]
-                    if matching_titles:
-                        print(f"No exact match found for '{search_query}'. Partial title matches found:")
-                        for match in matching_titles:
-                            print(f"  {match}")
-                    else:
-                        print(f"journal: error: '{search_query}' does not match any sub-journal title or valid date format.", file=sys.stderr)
-                        sys.exit(1)
+                print(f"journal: no entries found with exact title '{exact_match}'.", file=sys.stderr)
+        else:
+            # Fall back to show partial keyword title matches
+            matching_titles = [t for t in all_titles if target_lower in t.lower()]
+            if matching_titles:
+                print(f"No exact match found for '{target}'. Partial matches available:")
+                for match in matching_titles:
+                    print(f"  {match}")
+            else:
+                print(f"journal: error: '{target}' does not match any sub-journal title or valid date format.", file=sys.stderr)
+                sys.exit(1)
+        return
 
     # ------------------------------------------------------------------
-    # Show entries since a date
+    # SINCE
     # ------------------------------------------------------------------
-    elif args.since:
-        start = dp.parse(args.since)
-        if not start:
+    if args.since:
+        start_date = dp.parse(args.since)
+        if not start_date:
             print("journal: error: unknown date format", file=sys.stderr)
             sys.exit(1)
-        show_since(base_journal_dir, start)
+        show_since(base, start_date)
+        return
 
     # ------------------------------------------------------------------
-    # Add a new entry
+    # WRITE
     # ------------------------------------------------------------------
+    if not args.journal:
+        # Prompt dynamically for the journal name with a fallback default timestamp string
+        default_name = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        try:
+            args.journal = input(f"Title [{default_name}]: ").strip()
+            if not args.journal:
+                args.journal = default_name
+        except (KeyboardInterrupt, EOFError):
+            print("\nOperation cancelled.", file=sys.stderr)
+            sys.exit(1)
+
+    if not args.entry:
+        lines = prompt_for_entry()
+        if not lines:
+            print("journal: error: missing entry", file=sys.stderr)
+            sys.exit(1)
     else:
-        # If no entry arguments were supplied via CLI, prompt the user
-        if not args.entry:
-            entries = prompt_for_entry()
-            if not entries:
-                print("journal: error: missing entry", file=sys.stderr)
-                sys.exit(1)
-        else:
-            entries = args.entry
+        lines = args.entry
 
-        write_entry(active_journal_dir, entries, filename_override)
+    write_entry(base, lines, args.journal)
 
 
 if __name__ == "__main__":
