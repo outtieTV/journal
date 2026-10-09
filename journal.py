@@ -1,640 +1,706 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Cross-platform plain-text journal CLI (Python 3.8+).
 
-"""
-A simple CLI journal tool (Python 3.8+).
-
-Storage Format:
-~/.journal/YYYY-MM-DD/title.txt
+Entries are stored as: JOURNAL_ROOT/YYYY-MM-DD/TITLE.txt
+The default root is ~/.journal on Windows, Linux, and macOS. Override it with
+~/.journalrc, JOURNAL_HOME, --location, or the JOURNAL_HOME environment variable.
 """
 
 import argparse
-import configparser
-import datetime
+import datetime as dt
+import json
 import os
 import pathlib
+import random
 import re
 import shutil
 import subprocess
 import sys
-from typing import List, Optional, Tuple
+import tempfile
+import zipfile
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-# ----------------------------------------------------------------------
-# Defaults
-# ----------------------------------------------------------------------
+APP_NAME = "journal"
+VERSION = "2.0"
 DEFAULT_JOURNAL = "~/.journal"
-DEFAULT_JOURNAL_RC = "~/.journalrc"
+DEFAULT_CONFIG = "~/.journalrc"
+DATE_FORMAT = "%Y-%m-%d"
+INVALID_TITLE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+TIME_HEADER = re.compile(r"(?m)^###\s*🕒\s*Time:\s*\d{2}[:-_.]\d{2}[:-_.]\d{2}\s*\n*")
 
 
-# ----------------------------------------------------------------------
-# Terminal & Console Formatting Setup
-# ----------------------------------------------------------------------
-def init_terminal() -> None:
-    """Ensure UTF-8 encoding and ANSI escape sequence compatibility."""
-    if sys.platform == "win32":
-        # Enable ANSI colors on Windows Terminal / Legacy CMD
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            h_out = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-            mode = ctypes.c_ulong()
-            if kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
-                kernel32.SetConsoleMode(h_out, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        except Exception:
-            pass
-
-    # Ensure stdout/stderr streams default strictly to UTF-8
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except AttributeError:
-        pass
+class JournalError(Exception):
+    """Expected user-facing journal error."""
 
 
-# ----------------------------------------------------------------------
-# Helper classes & Date Parsers
-# ----------------------------------------------------------------------
-class DateParser:
-    """Parse informal date strings (e.g. ``2023-04-01`` or ``yesterday``)."""
-
-    @staticmethod
-    def _parse_iso(date_str: str) -> Optional[datetime.date]:
-        """Try ISO‑format parsing (YYYY‑MM‑DD)."""
-        try:
-            return datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-        except ValueError:
-            return None
-
-    @staticmethod
-    def _parse_word(date_str: str) -> Optional[datetime.date]:
-        """Very small subset: ``today`` or ``yesterday``."""
-        today = datetime.date.today()
-        normalized = date_str.lower().strip()
-        if normalized in ("today", "now"):
-            return today
-        if normalized == "yesterday":
-            return today - datetime.timedelta(days=1)
-        return None
-
-    def parse(self, s: str) -> Optional[datetime.date]:
-        """Return a ``datetime.date`` or ``None`` if parsing fails."""
-        for fn in (self._parse_iso, self._parse_word):
-            d = fn(s)
-            if d:
-                return d
-        return None
+def expand_path(value: str) -> pathlib.Path:
+    return pathlib.Path(os.path.expandvars(os.path.expanduser(value))).resolve()
 
 
-# ----------------------------------------------------------------------
-# Core Path/Config Helpers
-# ----------------------------------------------------------------------
-def expand_path(p: str) -> pathlib.Path:
-    """Expand ``~`` and return a fully resolved ``Path`` object."""
-    return pathlib.Path(os.path.expanduser(p)).resolve()
+def default_config_path() -> pathlib.Path:
+    return expand_path(os.environ.get("JOURNAL_CONFIG", DEFAULT_CONFIG))
 
 
 def load_config(config_path: pathlib.Path) -> pathlib.Path:
-    """Read configuration from file (if present) or return the default journal path."""
-    if not config_path.is_file():
-        return expand_path(DEFAULT_JOURNAL)
-
-    try:
-        cfg = configparser.ConfigParser()
-        cfg.read(config_path, encoding="utf-8")
-        location = cfg.get("journal", "location", fallback=DEFAULT_JOURNAL)
-        return expand_path(location)
-    except Exception as exc:
-        print(f"journal: warning: failed to parse config {config_path}: {exc}. Using default.", file=sys.stderr)
-        return expand_path(DEFAULT_JOURNAL)
-
-
-def ensure_dir(p: pathlib.Path) -> None:
-    """Create directory ``p`` if it does not exist."""
-    if not p.is_dir():
+    """Load a tiny INI config without making configparser a requirement for use."""
+    if config_path.is_file():
         try:
-            p.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            print(f"journal: error: cannot create directory {p!s}: {exc}", file=sys.stderr)
-            sys.exit(1)
+            import configparser
+            parser = configparser.ConfigParser()
+            parser.read(str(config_path), encoding="utf-8")
+            location = parser.get("journal", "location", fallback=DEFAULT_JOURNAL)
+            return expand_path(location)
+        except Exception as exc:
+            print("journal: warning: could not read config {}: {}".format(config_path, exc), file=sys.stderr)
+    return expand_path(os.environ.get("JOURNAL_HOME", DEFAULT_JOURNAL))
 
 
-def get_date_dir(base: pathlib.Path, date: datetime.date) -> pathlib.Path:
-    """Determine the date-based sub-folder layout: base_dir/YYYY-MM-DD."""
-    return base / f"{date:%Y-%m-%d}"
+def resolve_root(args: argparse.Namespace) -> pathlib.Path:
+    if getattr(args, "location", None):
+        return expand_path(args.location)
+    config = expand_path(getattr(args, "config", None) or str(default_config_path()))
+    return load_config(config)
 
 
-# ----------------------------------------------------------------------
-# Content Normalization
-# ----------------------------------------------------------------------
-def normalize_markdown(text: str) -> str:
-    """Normalize and format markdown text to ensure reliable rendering across parsers."""
-    # Normalize Windows line endings to Unix style
-    text = text.replace("\r\n", "\n")
-    
-    # Convert HTML linebreaks (<br>, <br/>, <br />) into proper Markdown newlines
-    text = re.sub(r'(?i)<br\s*/?>', '  \n', text)
-    
-    # Collapse excessive blank lines (more than 2 consecutive newlines) to exactly 2
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    
-    return text
-
-
-def clean_duplicate_time_headers(content: str) -> str:
-    """Clean duplicate or legacy timestamp header flags from the markdown content body."""
-    pattern = r'(?m)^###\s*🕒\s*Time:\s*\d{2}[:-_.]\d{2}[:-_.]\d{2}\s*\n*'
-    first_match = re.search(pattern, content)
-    if first_match:
-        start, end = first_match.span()
-        # Preserve only the very first timestamp, strip all subsequent duplicates
-        cleaned_body = re.sub(pattern, '', content[end:])
-        return (content[:end] + "\n" + cleaned_body).strip()
-    return content.strip()
-
-
-# ----------------------------------------------------------------------
-# Markdown Rendering
-# ----------------------------------------------------------------------
-def get_glow_command() -> Optional[List[str]]:
-    """Resolve glow path dynamically and append optional configuration arguments."""
-    glow_bin = shutil.which("glow") or shutil.which("glow.exe")
-    if not glow_bin:
-        return None
-
-    cmd = [glow_bin]
-    # Check for customizable user styling environment variables
-    style = os.getenv("JOURNAL_GLOW_STYLE") or os.getenv("GLOW_STYLE")
-    if style:
-        cmd.extend(["-s", style])
-    return cmd
-
-
-def print_markdown(text: str) -> None:
-    """Render markdown using `glow` if available, otherwise fallback to plain text."""
-    normalized_text = normalize_markdown(text)
-    glow_cmd = get_glow_command()
-
-    if glow_cmd:
-        try:
-            # Safely pipe normalized content through stdin directly to Glow with encoding forced to UTF-8
-            subprocess.run(
-                glow_cmd + ["-"],
-                input=normalized_text,
-                text=True,
-                encoding="utf-8",
-                check=True
-            )
-            return
-        except (subprocess.SubprocessError, OSError) as exc:
-            print(f"journal: warning: Glow rendering failed ({exc}). Falling back to plain text.", file=sys.stderr)
-
-    # Clean plain-text fallback
-    print(normalized_text)
-
-
-# ----------------------------------------------------------------------
-# WRITE (NEW STRUCTURE WITH DEDUPLICATION)
-# ----------------------------------------------------------------------
-def write_entry(base_dir: pathlib.Path, entries: List[str], title: str) -> None:
-    """Safely and atomically append a timestamped entry to the YYYY-MM-DD/title.txt location."""
-    ensure_dir(base_dir)
-
-    now = datetime.datetime.now()
-    date_dir = get_date_dir(base_dir, now.date())
-    ensure_dir(date_dir)
-
-    # Deduplicate sequential names if there is a collision
-    base_title = title
-    file_path = date_dir / f"{base_title}.txt"
-    counter = 1
-    while file_path.exists():
-        file_path = date_dir / f"{base_title} ({counter}).txt"
-        counter += 1
-
-    header = f"### 🕒 Time: {now:%H:%M:%S}\n\n"
-    content = "\n".join(entries).strip() + "\n\n"
-    temp_path = file_path.with_suffix(".tmp")
-
+def parse_date(value: str, today: Optional[dt.date] = None) -> dt.date:
+    today = today or dt.date.today()
+    text = value.strip().lower()
+    if text in ("today", "now"):
+        return today
+    if text == "yesterday":
+        return today - dt.timedelta(days=1)
+    if text == "tomorrow":
+        return today + dt.timedelta(days=1)
+    if text in ("last-week", "lastweek"):
+        return today - dt.timedelta(days=7)
+    if text in ("last-month", "lastmonth"):
+        month = today.month - 1 or 12
+        year = today.year - (1 if today.month == 1 else 0)
+        import calendar
+        return dt.date(year, month, min(today.day, calendar.monthrange(year, month)[1]))
+    match = re.fullmatch(r"(\d+)d", text)
+    if match:
+        return today - dt.timedelta(days=int(match.group(1)))
     try:
-        # Write consolidated content to a temporary file, then swap atomically
-        temp_path.write_text(header + content, encoding="utf-8")
-        temp_path.replace(file_path)
-        print(f"journal: entry saved to {file_path.relative_to(base_dir)}")
+        return dt.datetime.strptime(text, DATE_FORMAT).date()
+    except ValueError:
+        raise JournalError("invalid date {!r}; use YYYY-MM-DD, today, yesterday, tomorrow, last-week, last-month, or Nd".format(value))
+
+
+def safe_title(title: str) -> str:
+    """Return a safe, portable filename stem; reject path-like or empty titles."""
+    title = title.strip()
+    if not title or title in (".", ".."):
+        raise JournalError("entry title cannot be empty or '.'/'..'")
+    if "/" in title or "\\" in title or ".." in title:
+        raise JournalError("title cannot contain path separators or '..'")
+    title = INVALID_TITLE_CHARS.sub("_", title).strip(" .")
+    title = re.sub(r"\s+", " ", title)
+    if not title:
+        raise JournalError("title contains no usable filename characters")
+    # Windows reserves these device names even when the program runs elsewhere.
+    if title.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(r"(?i)(COM|LPT)[1-9]", title.split(".")[0]):
+        title = "_" + title
+    return title[:160]
+
+
+def date_dir(root: pathlib.Path, day: dt.date) -> pathlib.Path:
+    return root / day.strftime(DATE_FORMAT)
+
+
+def safe_entry_path(root: pathlib.Path, day: dt.date, filename: str) -> pathlib.Path:
+    """Resolve a filename inside the expected date folder and reject traversal."""
+    if filename.endswith(".txt"):
+        filename = filename[:-4]
+    stem = safe_title(filename)
+    folder = date_dir(root, day).resolve()
+    path = (folder / (stem + ".txt")).resolve()
+    if path.parent != folder:
+        raise JournalError("entry path escapes its date directory")
+    return path
+
+
+def atomic_write(path: pathlib.Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=str(path.parent),
+                                         prefix="." + path.name + ".", suffix=".tmp", delete=False) as handle:
+            temp_name = handle.name
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, str(path))
     except OSError as exc:
-        print(f"journal: error: failed to write entry to file {file_path}: {exc}", file=sys.stderr)
-        if temp_path.exists():
+        if temp_name:
             try:
-                temp_path.unlink()
+                os.unlink(temp_name)
             except OSError:
                 pass
-        sys.exit(1)
+        raise JournalError("could not write {}: {}".format(path, exc))
 
 
-# ----------------------------------------------------------------------
-# LIST ENTRIES IN DATE
-# ----------------------------------------------------------------------
-def list_titles_for_date(base_dir: pathlib.Path, date: datetime.date) -> None:
-    """Find and print only the titles of entries on a specific date, without showing their full contents."""
-    date_dir = get_date_dir(base_dir, date)
+def normalize_markdown(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(?i)<br\s*/?>", "  \n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
-    if not date_dir.exists():
-        print(f"journal: no entries found for {date}.", file=sys.stderr)
-        return
 
-    try:
-        files = sorted(date_dir.glob("*.txt"))
-    except OSError as exc:
-        print(f"journal: error: failed to read entries on date {date}: {exc}", file=sys.stderr)
-        return
-
-    if not files:
-        print(f"journal: no entries found for {date}.", file=sys.stderr)
-        return
-
-    print(f"Journal entries for {date}:")
-    for f in files:
-        # Extract time header if present to show time next to titles
-        time_str = "Legacy Entry"
+def render_markdown(text: str, plain: bool = False) -> None:
+    normalized = normalize_markdown(text)
+    glow = None if plain else (shutil.which("glow") or shutil.which("glow.exe"))
+    style = os.environ.get("JOURNAL_GLOW_STYLE") or os.environ.get("GLOW_STYLE")
+    if glow:
+        cmd = [glow]
+        if style:
+            cmd += ["-s", style]
         try:
-            first_few_lines = f.read_text(encoding="utf-8")[:200]
-            time_match = re.search(r"Time:\s*(\d{2}[:-_.]\d{2}[:-_.]\d{2})", first_few_lines)
-            if time_match:
-                time_str = time_match.group(1)
-        except Exception:
-            pass
-        print(f"  • {f.name} (Time: {time_str})")
+            subprocess.run(cmd + ["-"], input=normalized, text=True, encoding="utf-8", check=True)
+            return
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("journal: warning: Glow failed ({}); using plain text".format(exc), file=sys.stderr)
+    print(normalized)
 
 
-# ----------------------------------------------------------------------
-# READ ENTRY
-# ----------------------------------------------------------------------
-def read_journal_content(base_dir: pathlib.Path, title: str) -> str:
-    """Scan all date directories and read the content of a target journal entry."""
-    if not base_dir.is_dir():
-        return ""
-
-    # Check matching with or without standard .txt extension
-    search_title = title if title.endswith(".txt") else f"{title}.txt"
-
-    try:
-        # Loop through date folders (e.g., YYYY-MM-DD)
-        for date_dir in sorted(base_dir.iterdir(), reverse=True):
-            if not date_dir.is_dir():
-                continue
-
-            candidate = date_dir / search_title
-            if candidate.is_file():
-                try:
-                    content = candidate.read_text(encoding="utf-8").strip()
-                    if content:
-                        content = clean_duplicate_time_headers(content)
-                        return f"## 📅 Date: {date_dir.name} | {candidate.stem}\n\n{content}"
-                except OSError as exc:
-                    print(f"journal: warning: failed to read file {candidate.name}: {exc}", file=sys.stderr)
-    except OSError as exc:
-         print(f"journal: error: failed to scan base directory {base_dir}: {exc}", file=sys.stderr)
-
-    return ""
+def clean_legacy_headers(content: str) -> str:
+    first = TIME_HEADER.search(content)
+    if not first:
+        return content.strip()
+    head = content[:first.end()]
+    body = TIME_HEADER.sub("", content[first.end():])
+    return (head.rstrip() + "\n\n" + body.strip()).strip()
 
 
-# ----------------------------------------------------------------------
-# LIST ALL TITLES & DATE DIRECTORIES
-# ----------------------------------------------------------------------
-def get_all_titles(base_dir: pathlib.Path) -> List[str]:
-    """Return all unique journal titles found inside our date directories."""
-    titles = set()
-    if not base_dir.exists():
+def parse_tags(content: str) -> List[str]:
+    """Read optional tags from a simple '# Tags: work, personal' line."""
+    match = re.search(r"(?im)^#\s*Tags:\s*(.*?)\s*$", content)
+    if not match:
         return []
+    return [x.strip().lstrip("#").strip() for x in match.group(1).split(",") if x.strip()]
 
+
+def list_entry_files(root: pathlib.Path, start: Optional[dt.date] = None,
+                     end: Optional[dt.date] = None) -> List[Tuple[dt.date, pathlib.Path]]:
+    found: List[Tuple[dt.date, pathlib.Path]] = []
+    if not root.is_dir():
+        return found
     try:
-        for date_dir in base_dir.iterdir():
-            if not date_dir.is_dir():
-                continue
-            for f in date_dir.glob("*.txt"):
-                titles.add(f.stem)
-                titles.add(f.name)  # Include standard ext names for explicit target looks
+        dirs = list(root.iterdir())
+    except OSError as exc:
+        raise JournalError("cannot list journal directory {}: {}".format(root, exc))
+    for folder in dirs:
+        if not folder.is_dir():
+            continue
+        try:
+            day = dt.datetime.strptime(folder.name, DATE_FORMAT).date()
+        except ValueError:
+            continue
+        if start and day < start:
+            continue
+        if end and day > end:
+            continue
+        try:
+            for path in folder.glob("*.txt"):
+                if path.is_file():
+                    found.append((day, path))
+        except OSError as exc:
+            print("journal: warning: cannot read {}: {}".format(folder, exc), file=sys.stderr)
+    return sorted(found, key=lambda item: (item[0], _entry_time(item[1]), item[1].name.lower()))
+
+
+def _entry_time(path: pathlib.Path) -> str:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for _ in range(5):
+                line = f.readline()
+                if not line:
+                    break
+                m = re.search(r"Time:\s*(\d{2}[:-_.]\d{2}[:-_.]\d{2})", line)
+                if m:
+                    return m.group(1).replace("-", ":").replace("_", ":").replace(".", ":")
     except OSError:
         pass
+    return "00:00:00"
 
-    return sorted(list(titles))
 
-
-def list_all(base_dir: pathlib.Path) -> None:
-    """Show available journals nested cleanly under their parent YYYY-MM-DD date folders."""
-    if not base_dir.exists():
-        print("journal: empty")
-        return
-
+def read_entry(path: pathlib.Path) -> str:
     try:
-        dirs = [d for d in base_dir.iterdir() if d.is_dir()]
+        return path.read_text(encoding="utf-8").strip()
     except OSError as exc:
-        print(f"journal: error: failed to list directories in {base_dir}: {exc}", file=sys.stderr)
-        return
-
-    if not dirs:
-        print("journal: empty")
-        return
-
-    print("Available Journals:")
-    for date_dir in sorted(dirs):
-        try:
-            files = sorted(date_dir.glob("*.txt"))
-            if files:
-                print(f"\n{date_dir.name}")
-                for f in files:
-                    print(f"  • {f.name}")
-        except OSError:
-            pass
+        raise JournalError("cannot read {}: {}".format(path, exc))
 
 
-# ----------------------------------------------------------------------
-# SINCE
-# ----------------------------------------------------------------------
-def show_since(base_dir: pathlib.Path, since: datetime.date) -> None:
-    """Print all entries from ``since`` up to today, sorted globally in chronological order."""
-    today = datetime.date.today()
-    collected_entries: List[Tuple[datetime.date, str, str]] = []
-
-    if not base_dir.is_dir():
-        print("journal: empty")
-        return
-
-    try:
-        for date_dir in base_dir.iterdir():
-            if not date_dir.is_dir():
-                continue
-
-            try:
-                dir_date = datetime.datetime.strptime(date_dir.name, "%Y-%m-%d").date()
-            except ValueError:
-                continue
-
-            if since <= dir_date <= today:
-                try:
-                    for f in sorted(date_dir.glob("*.txt")):
-                        content = f.read_text(encoding="utf-8").strip()
-                        if content:
-                            content = clean_duplicate_time_headers(content)
-                            collected_entries.append((dir_date, f.stem, content))
-                except OSError:
-                    pass
-    except OSError as exc:
-        print(f"journal: error: failed to read entries since {since}: {exc}", file=sys.stderr)
-        return
-
-    if not collected_entries:
-        print("journal: no matching entries found.")
-        return
-
-    # Sort globally by date first, then by title name
-    collected_entries.sort(key=lambda x: (x[0], x[1]))
-
-    full_output = [f"# 📚 Journal Entries Since {since}"]
-    for entry_date, title, content in collected_entries:
-        header = f"## 📅 {entry_date:%Y-%m-%d} | {title}\n"
-        full_output.append(f"{header}\n{content}")
-
-    print_markdown("\n\n---\n\n".join(full_output))
+def resolve_title(root: pathlib.Path, title: str, day: Optional[dt.date] = None) -> Tuple[dt.date, pathlib.Path]:
+    title = title.strip()
+    if day:
+        path = safe_entry_path(root, day, title)
+        if path.is_file():
+            return day, path
+        raise JournalError("entry {!r} not found on {}".format(title, day))
+    wanted = title.lower()
+    matches = [(d, p) for d, p in list_entry_files(root) if p.stem.lower() == wanted or p.name.lower() == wanted]
+    if not matches:
+        # Helpful partial-title suggestions.
+        partial = [(d, p) for d, p in list_entry_files(root) if wanted in p.stem.lower()]
+        if partial:
+            options = ", ".join("{} ({})".format(p.stem, d) for d, p in partial[:12])
+            raise JournalError("no exact title match for {!r}. Partial matches: {}".format(title, options))
+        raise JournalError("no entry found with title {!r}".format(title))
+    if len(matches) > 1:
+        options = "\n".join("  {}  {}".format(d, p.stem) for d, p in matches)
+        raise JournalError("title {!r} exists on multiple dates; specify a date:\n{}".format(title, options))
+    return matches[0]
 
 
-# ----------------------------------------------------------------------
-# Multi-line Prompt helper
-# ----------------------------------------------------------------------
-def prompt_for_entry() -> List[str]:
-    """Prompt the user for their journal entry directly with multi-line paste/input capability."""
-    print("----------------------------------------------------------------------")
-    print("Enter/Paste your journal entry. When finished:")
-    if sys.platform == "win32":
-        print("  - Type ':wq' on a new line and press Enter")
-        print("  - OR press Ctrl+Z then Enter to submit.")
-    else:
-        print("  - Type ':wq' on a new line and press Enter")
-        print("  - OR press Ctrl+D to submit.")
-    print("----------------------------------------------------------------------")
-    
+def prompt_multiline() -> str:
+    print("Enter/paste your journal entry. Finish with a line containing :wq.")
+    print("You can also send EOF (Ctrl+D on Unix, Ctrl+Z then Enter on Windows).")
     lines: List[str] = []
-    while True:
-        try:
+    try:
+        while True:
             line = input()
-            # Intercept saving exit indicator
             if line.strip() == ":wq":
                 break
             lines.append(line)
-        except EOFError:
-            break
-        except KeyboardInterrupt:
-            print("\nOperation cancelled.", file=sys.stderr)
-            sys.exit(1)
-            
-    # Cleanup trailing empty entries
+    except EOFError:
+        pass
+    except KeyboardInterrupt:
+        raise JournalError("cancelled")
     while lines and not lines[-1].strip():
         lines.pop()
-        
-    return lines
+    return "\n".join(lines).strip()
 
 
-# ----------------------------------------------------------------------
-# ARG PARSER
-# ----------------------------------------------------------------------
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="A CLI tool to help with keeping a work/personal journal"
-    )
-    p.add_argument("--version", action="version", version="journal 1.0")
-    p.add_argument("-c", "--config", default=DEFAULT_JOURNAL_RC,
-                   help="Path to config file")
-    p.add_argument("-l", "--location",
-                   help="Override journal storage location")
-    p.add_argument("-j", "--journal", help="Entry title")
-    p.add_argument("-s", "--since",
-                   help="Show all entries since DATE (YYYY‑MM‑DD or today/yesterday)")
-    p.add_argument("-v", "--view", nargs="*",
-                   help="View journals. Omitted lists all files. One arg (date) lists matching files. Two args (date, file) prints content.")
-    p.add_argument("-d", "--delete", nargs="*",
-                   help="Delete entries. One arg (date) lists files. Two args (date, file) deletes the file.")
-    p.add_argument("entry", nargs="*", help="Direct text entry")
-    return p
+def create_entry(root: pathlib.Path, title: str, body: str, day: Optional[dt.date] = None,
+                 tags: Optional[Sequence[str]] = None) -> pathlib.Path:
+    day = day or dt.date.today()
+    title = safe_title(title)
+    folder = date_dir(root, day)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = safe_entry_path(root, day, title)
+    counter = 1
+    while path.exists():
+        path = safe_entry_path(root, day, "{} ({})".format(title, counter))
+        counter += 1
+    now = dt.datetime.now()
+    tag_line = "# Tags: {}\n\n".format(", ".join(dict.fromkeys(t.strip() for t in (tags or []) if t.strip()))) if tags else ""
+    text = "### 🕒 Time: {}\n\n{}{}\n".format(now.strftime("%H:%M:%S"), tag_line, body.strip())
+    atomic_write(path, text)
+    return path
 
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
-def main() -> None:
-    init_terminal()
+def command_add(args: argparse.Namespace, root: pathlib.Path) -> None:
+    body = " ".join(args.text).strip() if args.text else ""
+    if not body:
+        body = prompt_multiline()
+    if not body:
+        raise JournalError("entry body is empty; nothing saved")
+    title = args.title
+    if not title:
+        default = dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        title = input("Title [{}]: ".format(default)).strip() or default
+    path = create_entry(root, title, body, parse_date(args.date) if args.date else None, args.tag)
+    print("journal: saved {}".format(path.relative_to(root)))
 
-    args = build_parser().parse_args()
 
-    base = load_config(expand_path(args.config))
-    if args.location:
-        base = expand_path(args.location)
-
-    dp = DateParser()
-
-    # ------------------------------------------------------------------
-    # DELETE MODE
-    # ------------------------------------------------------------------
-    if args.delete is not None:
-        if len(args.delete) == 0:
-            print("journal: error: --delete requires a date, or a date and a filename.", file=sys.stderr)
-            sys.exit(1)
-
-        if len(args.delete) == 1:
-            target = args.delete[0].strip()
-            parsed_date = dp.parse(target)
-            if not parsed_date:
-                print(f"journal: error: '{target}' is not a valid date format. Use YYYY-MM-DD.", file=sys.stderr)
-                sys.exit(1)
-
-            date_dir = get_date_dir(base, parsed_date)
-            if not date_dir.exists():
-                print(f"journal: no entries found for {parsed_date} to delete.", file=sys.stderr)
-                return
-
-            files = sorted(date_dir.glob("*.txt"))
-            if not files:
-                print(f"journal: no entries found for {parsed_date} to delete.", file=sys.stderr)
-                return
-
-            print(f"Entries on {parsed_date} available for deletion:")
-            for f in files:
-                print(f"  • {f.name}")
-            return
-
-        if len(args.delete) >= 2:
-            date_str = args.delete[0].strip()
-            filename = args.delete[1].strip()
-
-            parsed_date = dp.parse(date_str)
-            if not parsed_date:
-                print(f"journal: error: '{date_str}' is not a valid date format. Use YYYY-MM-DD.", file=sys.stderr)
-                sys.exit(1)
-
-            if not filename.endswith(".txt"):
-                filename += ".txt"
-
-            date_dir = get_date_dir(base, parsed_date)
-            file_path = date_dir / filename
-            if file_path.is_file():
-                try:
-                    file_path.unlink()
-                    print(f"journal: deleted '{filename}' from {parsed_date}.")
-                    # Safely clean up parent date directory if it is now completely empty
-                    if date_dir.is_dir() and not any(date_dir.iterdir()):
-                        date_dir.rmdir()
-                except OSError as exc:
-                    print(f"journal: error: failed to delete file: {exc}", file=sys.stderr)
-                    sys.exit(1)
-            else:
-                print(f"journal: error: '{filename}' not found on {parsed_date}.", file=sys.stderr)
-                sys.exit(1)
-            return
-
-    # ------------------------------------------------------------------
-    # VIEW MODE
-    # ------------------------------------------------------------------
-    if args.view is not None:
-        if len(args.view) == 0 or args.view == ["all"]:
-            list_all(base)
-            return
-
-        # Handle single argument lookup
-        if len(args.view) == 1:
-            target = args.view[0].strip()
-            target_lower = target.lower()
-
-            # Try viewing as a pure YYYY-MM-DD date lookup first
-            parsed_date = dp.parse(target)
-            if parsed_date:
-                list_titles_for_date(base, parsed_date)
-                return
-
-            # Try to locate exact title (case-insensitive check)
-            all_titles = get_all_titles(base)
-            exact_match: Optional[str] = None
-            for title in all_titles:
-                if title.lower() == target_lower:
-                    exact_match = title
-                    break
-
-            if exact_match:
-                content = read_journal_content(base, exact_match)
-                if content:
-                    markdown_payload = f"# 📒 Journal Title: {exact_match}\n\n{content}"
-                    print_markdown(markdown_payload)
-                else:
-                    print(f"journal: no entries found with exact title '{exact_match}'.", file=sys.stderr)
-            else:
-                # Fall back to show partial keyword title matches
-                matching_titles = [t for t in all_titles if target_lower in t.lower()]
-                if matching_titles:
-                    print(f"No exact match found for '{target}'. Partial matches available:")
-                    for match in sorted(list(set(matching_titles))):
-                        print(f"  • {match}")
-                else:
-                    print(f"journal: error: '{target}' does not match any sub-journal title or valid date format.", file=sys.stderr)
-                    sys.exit(1)
-            return
-
-        # Handle dual-argument lookup (date AND explicit file match)
-        if len(args.view) >= 2:
-            date_str = args.view[0].strip()
-            filename = args.view[1].strip()
-
-            parsed_date = dp.parse(date_str)
-            if not parsed_date:
-                print(f"journal: error: '{date_str}' is not a valid date format. Use YYYY-MM-DD.", file=sys.stderr)
-                sys.exit(1)
-
-            if not filename.endswith(".txt"):
-                filename += ".txt"
-
-            date_dir = get_date_dir(base, parsed_date)
-            file_path = date_dir / filename
-            if file_path.is_file():
-                content = file_path.read_text(encoding="utf-8").strip()
-                content = clean_duplicate_time_headers(content)
-                payload = f"# 📒 {parsed_date} | {file_path.stem}\n\n{content}"
-                print_markdown(payload)
-            else:
-                print(f"journal: error: '{filename}' not found on {parsed_date}.", file=sys.stderr)
-                sys.exit(1)
-            return
-
-    # ------------------------------------------------------------------
-    # SINCE
-    # ------------------------------------------------------------------
-    if args.since:
-        start_date = dp.parse(args.since)
-        if not start_date:
-            print("journal: error: unknown date format", file=sys.stderr)
-            sys.exit(1)
-        show_since(base, start_date)
-        return
-
-    # ------------------------------------------------------------------
-    # WRITE
-    # ------------------------------------------------------------------
-    if not args.journal:
-        # Prompt dynamically for the journal name with a fallback default timestamp string
-        default_name = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+def command_list(args: argparse.Namespace, root: pathlib.Path) -> None:
+    start = end = None
+    if args.date:
+        start = end = parse_date(args.date)
+    elif args.month:
         try:
-            args.journal = input(f"Title [{default_name}]: ").strip()
-            if not args.journal:
-                args.journal = default_name
-        except (KeyboardInterrupt, EOFError):
-            print("\nOperation cancelled.", file=sys.stderr)
-            sys.exit(1)
+            year_s, month_s = args.month.split("-", 1)
+            year, month = int(year_s), int(month_s)
+            import calendar
+            start = dt.date(year, month, 1)
+            end = dt.date(year, month, calendar.monthrange(year, month)[1])
+        except (ValueError, TypeError):
+            raise JournalError("--month must be YYYY-MM")
+    elif args.week:
+        end = parse_date(args.week)
+        start = end - dt.timedelta(days=6)
+    files = list_entry_files(root, start, end)
+    if not files:
+        print("journal: no entries found")
+        return
+    for day, path in files:
+        print("{}  {}  [{}]".format(day, path.stem, _entry_time(path)))
 
-    if not args.entry:
-        lines = prompt_for_entry()
-        if not lines:
-            print("journal: error: missing entry", file=sys.stderr)
-            sys.exit(1)
+
+def command_show(args: argparse.Namespace, root: pathlib.Path) -> None:
+    day = parse_date(args.date) if args.date else None
+    day, path = resolve_title(root, args.title, day)
+    render_markdown("# 📒 {} | {}\n\n{}".format(day, path.stem, clean_legacy_headers(read_entry(path))), args.plain)
+
+
+def command_search(args: argparse.Namespace, root: pathlib.Path) -> None:
+    needle = args.query if args.case_sensitive else args.query.casefold()
+    start = parse_date(args.since) if args.since else None
+    end = parse_date(args.until) if args.until else None
+    hits = 0
+    for day, path in list_entry_files(root, start, end):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            print("journal: warning: cannot read {}: {}".format(path, exc), file=sys.stderr)
+            continue
+        matches = []
+        for number, line in enumerate(lines, 1):
+            haystack = line if args.case_sensitive else line.casefold()
+            if needle in haystack:
+                matches.append((number, line.strip()))
+        if matches:
+            hits += len(matches)
+            print("{}  {}".format(day, path.stem))
+            for number, line in matches[:args.max_matches]:
+                print("  {:>4}: {}".format(number, line))
+            if args.full:
+                render_markdown(read_entry(path), args.plain)
+    if not hits:
+        print("journal: no matches for {!r}".format(args.query))
     else:
-        lines = args.entry
+        print("\n{} matching line(s)".format(hits))
 
-    write_entry(base, lines, args.journal)
+
+def command_edit(args: argparse.Namespace, root: pathlib.Path) -> None:
+    day, path = resolve_title(root, args.title, parse_date(args.date) if args.date else None)
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        editor = "notepad" if os.name == "nt" else ("nano" if shutil.which("nano") else "vi")
+    # Honor editor arguments such as "code --wait" without invoking a shell.
+    import shlex
+    command = shlex.split(editor, posix=(os.name != "nt")) + [str(path)]
+    try:
+        result = subprocess.run(command, check=False)
+    except OSError as exc:
+        raise JournalError("could not launch editor {!r}: {}".format(editor, exc))
+    if result.returncode:
+        raise JournalError("editor exited with status {}".format(result.returncode))
+    print("journal: edited {} ({})".format(path.stem, day))
+
+
+def command_append(args: argparse.Namespace, root: pathlib.Path) -> None:
+    day, path = resolve_title(root, args.title, parse_date(args.date) if args.date else None)
+    body = " ".join(args.text).strip() if args.text else prompt_multiline()
+    if not body:
+        raise JournalError("append text is empty")
+    old = read_entry(path)
+    atomic_write(path, old.rstrip() + "\n\n" + body + "\n")
+    print("journal: appended to {} ({})".format(path.stem, day))
+
+
+def confirm_or_fail(prompt: str, yes: bool) -> None:
+    if yes:
+        return
+    try:
+        answer = input(prompt + " [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        raise JournalError("cancelled")
+    if answer not in ("y", "yes"):
+        raise JournalError("cancelled; no changes made")
+
+
+def command_delete(args: argparse.Namespace, root: pathlib.Path) -> None:
+    day, path = resolve_title(root, args.title, parse_date(args.date) if args.date else None)
+    confirm_or_fail("Delete {!r} from {}? This cannot be undone.".format(path.stem, day), args.yes)
+    try:
+        path.unlink()
+        folder = path.parent
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
+    except OSError as exc:
+        raise JournalError("could not delete {}: {}".format(path, exc))
+    print("journal: deleted {} ({})".format(path.stem, day))
+
+
+def command_rename(args: argparse.Namespace, root: pathlib.Path) -> None:
+    day, old = resolve_title(root, args.title, parse_date(args.date) if args.date else None)
+    new_stem = safe_title(args.new_title)
+    new = safe_entry_path(root, day, new_stem)
+    if new.exists():
+        raise JournalError("an entry named {!r} already exists on {}".format(new_stem, day))
+    try:
+        old.rename(new)
+    except OSError as exc:
+        raise JournalError("could not rename entry: {}".format(exc))
+    print("journal: renamed {!r} to {!r}".format(old.stem, new.stem))
+
+
+def command_tags(args: argparse.Namespace, root: pathlib.Path) -> None:
+    found: Dict[str, List[str]] = {}
+    for day, path in list_entry_files(root):
+        try:
+            tags = parse_tags(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        for tag in tags:
+            found.setdefault(tag, []).append("{} {}".format(day, path.stem))
+    if args.tag:
+        key = args.tag.casefold()
+        matches = [(tag, entries) for tag, entries in found.items() if tag.casefold() == key]
+        if not matches:
+            print("journal: no entries tagged {!r}".format(args.tag))
+            return
+        for tag, entries in matches:
+            print("{} ({} entries)".format(tag, len(entries)))
+            for entry in entries:
+                print("  " + entry)
+    else:
+        if not found:
+            print("journal: no tags found")
+            return
+        for tag in sorted(found, key=str.casefold):
+            print("{} ({})".format(tag, len(found[tag])))
+
+
+def command_export(args: argparse.Namespace, root: pathlib.Path) -> None:
+    start = parse_date(args.since) if args.since else None
+    end = parse_date(args.until) if args.until else None
+    entries = list_entry_files(root, start, end)
+    if not entries:
+        raise JournalError("no entries found in the requested range")
+    chunks = ["# Journal Export\n"]
+    for day, path in entries:
+        chunks.append("## {} | {}\n\n{}".format(day, path.stem, clean_legacy_headers(read_entry(path))))
+    output = expand_path(args.output)
+    atomic_write(output, "\n\n---\n\n".join(chunks).rstrip() + "\n")
+    print("journal: exported {} entries to {}".format(len(entries), output))
+
+
+def command_backup(args: argparse.Namespace, root: pathlib.Path) -> None:
+    if not root.is_dir():
+        raise JournalError("journal directory does not exist: {}".format(root))
+    output = expand_path(args.output) if args.output else expand_path("journal-backup-{}.zip".format(dt.datetime.now().strftime("%Y%m%d-%H%M%S")))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(str(output), "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in root.rglob("*"):
+                if path.is_file() and path.resolve() != output.resolve():
+                    archive.write(str(path), str(path.relative_to(root)))
+    except OSError as exc:
+        raise JournalError("backup failed: {}".format(exc))
+    print("journal: backup created at {}".format(output))
+
+
+def command_restore(args: argparse.Namespace, root: pathlib.Path) -> None:
+    archive_path = expand_path(args.archive)
+    if not archive_path.is_file():
+        raise JournalError("archive not found: {}".format(archive_path))
+    try:
+        with zipfile.ZipFile(str(archive_path), "r") as archive:
+            members = archive.infolist()
+            for member in members:
+                target = (root / member.filename).resolve()
+                if target != root.resolve() and root.resolve() not in target.parents:
+                    raise JournalError("archive contains unsafe path: {}".format(member.filename))
+            files = [m for m in members if not m.is_dir()]
+            if not files:
+                raise JournalError("archive contains no files")
+            confirm_or_fail("Restore {} file(s) into {}? Existing files will not be overwritten.".format(len(files), root), args.yes)
+            root.mkdir(parents=True, exist_ok=True)
+            restored = 0
+            for member in files:
+                target = (root / member.filename).resolve()
+                if target.exists():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member, "r") as source, target.open("xb") as dest:
+                    shutil.copyfileobj(source, dest)
+                restored += 1
+    except zipfile.BadZipFile:
+        raise JournalError("invalid ZIP archive")
+    except OSError as exc:
+        raise JournalError("restore failed: {}".format(exc))
+    print("journal: restored {} file(s); existing files were preserved".format(restored))
+
+
+def command_random(args: argparse.Namespace, root: pathlib.Path) -> None:
+    entries = list_entry_files(root)
+    if not entries:
+        raise JournalError("journal is empty")
+    day, path = random.choice(entries)
+    render_markdown("# 📒 {} | {}\n\n{}".format(day, path.stem, clean_legacy_headers(read_entry(path))), args.plain)
+
+
+def command_init(args: argparse.Namespace, root: pathlib.Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    print("journal directory: {}".format(root))
+    print("config file: {}".format(expand_path(args.config)))
+    print("To set a custom location, put this in your config file:\n\n[journal]\nlocation = {}".format(root))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="journal", description="Cross-platform plain-text journal CLI")
+    parser.add_argument("--version", action="version", version="journal {}".format(VERSION))
+    parser.add_argument("-c", "--config", default=str(default_config_path()), help="INI config path (default: ~/.journalrc)")
+    parser.add_argument("-l", "--location", help="override journal directory (default: ~/.journal)")
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("add", help="create a journal entry")
+    p.add_argument("title", nargs="?", help="entry title")
+    p.add_argument("--text", nargs="+", help="entry text; omit to enter multiline text")
+    p.add_argument("--date", help="entry date (default: today)")
+    p.add_argument("--tag", action="append", default=[], help="tag; may be repeated")
+
+    p = sub.add_parser("list", help="list entries")
+    p.add_argument("--date", help="only entries for this date")
+    p.add_argument("--week", nargs="?", const="today", help="show seven days ending on DATE (default: today)")
+    p.add_argument("--month", help="show entries in YYYY-MM")
+
+    p = sub.add_parser("show", help="show an entry by title, optionally specifying its date")
+    p.add_argument("title")
+    p.add_argument("date", nargs="?", help="date for this title")
+    p.add_argument("--plain", action="store_true", help="do not use Glow")
+
+    p = sub.add_parser("search", help="search entry contents")
+    p.add_argument("query")
+    p.add_argument("--since")
+    p.add_argument("--until")
+    p.add_argument("--case-sensitive", action="store_true")
+    p.add_argument("--full", action="store_true", help="also print complete matching entries")
+    p.add_argument("--max-matches", type=int, default=20, help="maximum matching lines shown per entry")
+    p.add_argument("--plain", action="store_true")
+
+    p = sub.add_parser("edit", help="edit an existing entry using VISUAL/EDITOR")
+    p.add_argument("title")
+    p.add_argument("date", nargs="?")
+
+    p = sub.add_parser("append", help="append text to an existing entry")
+    p.add_argument("title")
+    p.add_argument("text", nargs="*")
+    p.add_argument("--date")
+
+    p = sub.add_parser("rename", help="rename an entry")
+    p.add_argument("title")
+    p.add_argument("new_title")
+    p.add_argument("--date")
+
+    p = sub.add_parser("delete", help="delete an entry")
+    p.add_argument("title")
+    p.add_argument("date", nargs="?")
+    p.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
+
+    p = sub.add_parser("tags", help="list tags or entries carrying a tag")
+    p.add_argument("tag", nargs="?")
+
+    p = sub.add_parser("export", help="export a date range to Markdown")
+    p.add_argument("output", help="output Markdown file")
+    p.add_argument("--since")
+    p.add_argument("--until")
+
+    p = sub.add_parser("backup", help="create a ZIP backup")
+    p.add_argument("output", nargs="?", help="output ZIP path (default: timestamped ZIP in current directory)")
+
+    p = sub.add_parser("restore", help="restore a ZIP backup without overwriting existing files")
+    p.add_argument("archive")
+    p.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
+
+    p = sub.add_parser("random", help="show a random journal entry")
+    p.add_argument("--plain", action="store_true")
+
+    sub.add_parser("init", help="create the journal directory and show configuration")
+
+    # Backward-compatible legacy flags.
+    parser.add_argument("-j", "--journal", help="legacy: entry title")
+    parser.add_argument("-s", "--since", help="legacy: show entries since DATE")
+    parser.add_argument("-v", "--view", nargs="*", help="legacy: list entries, list a date, or show DATE TITLE")
+    parser.add_argument("-d", "--delete", dest="delete_legacy", nargs="*", help="legacy: list/delete entries by date and title")
+    parser.add_argument("entry", nargs="*", help=argparse.SUPPRESS)
+    return parser
+
+
+def legacy_main(args: argparse.Namespace, root: pathlib.Path) -> bool:
+    dp = parse_date
+    if args.delete_legacy is not None:
+        values = args.delete_legacy
+        if len(values) == 1:
+            day = dp(values[0])
+            files = list_entry_files(root, day, day)
+            if not files:
+                print("journal: no entries found on {}".format(day))
+            else:
+                for _, path in files:
+                    print(path.name)
+            return True
+        if len(values) >= 2:
+            day = dp(values[0])
+            path = safe_entry_path(root, day, values[1])
+            if not path.is_file():
+                raise JournalError("entry not found: {}".format(path.name))
+            confirm_or_fail("Delete {} from {}?".format(path.name, day), False)
+            path.unlink()
+            print("journal: deleted {}".format(path.name))
+            return True
+        raise JournalError("legacy --delete requires a date, optionally followed by a title")
+    if args.view is not None:
+        if not args.view or args.view == ["all"]:
+            for day, path in list_entry_files(root):
+                print("{}  {}".format(day, path.name))
+            return True
+        if len(args.view) == 1:
+            value = args.view[0]
+            try:
+                day = dp(value)
+                for _, path in list_entry_files(root, day, day):
+                    print(path.name)
+                return True
+            except JournalError:
+                day, path = resolve_title(root, value)
+                render_markdown("# 📒 {} | {}\n\n{}".format(day, path.stem, clean_legacy_headers(read_entry(path))))
+                return True
+        day = dp(args.view[0])
+        _, path = resolve_title(root, args.view[1], day)
+        render_markdown("# 📒 {} | {}\n\n{}".format(day, path.stem, clean_legacy_headers(read_entry(path))))
+        return True
+    if args.since:
+        start = dp(args.since)
+        entries = list_entry_files(root, start, dt.date.today())
+        if not entries:
+            print("journal: no entries found")
+        else:
+            chunks = ["# Journal entries since {}".format(start)]
+            for day, path in entries:
+                chunks.append("## {} | {}\n\n{}".format(day, path.stem, clean_legacy_headers(read_entry(path))))
+            render_markdown("\n\n---\n\n".join(chunks))
+        return True
+    if args.journal or args.entry:
+        title = args.journal or dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        body = " ".join(args.entry).strip() or prompt_multiline()
+        if not body:
+            raise JournalError("entry body is empty")
+        path = create_entry(root, title, body)
+        print("journal: saved {}".format(path.relative_to(root)))
+        return True
+    return False
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        root = resolve_root(args)
+        if args.command:
+            handlers = {
+                "add": command_add, "list": command_list, "show": command_show,
+                "search": command_search, "edit": command_edit, "append": command_append,
+                "rename": command_rename, "delete": command_delete, "tags": command_tags,
+                "export": command_export, "backup": command_backup, "restore": command_restore,
+                "random": command_random, "init": command_init,
+            }
+            handlers[args.command](args, root)
+            return 0
+        if legacy_main(args, root):
+            return 0
+        parser.print_help()
+        return 0
+    except JournalError as exc:
+        print("journal: error: {}".format(exc), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\njournal: cancelled", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
